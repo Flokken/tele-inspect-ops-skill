@@ -7,10 +7,10 @@ AIGC:
   ContentProducer: '001191110102MAD55U9H0F10002'
   ContentPropagator: '001191110102MAD55U9H0F10002'
   Label: '1'
-  ProduceID: 'cbab45d8-3415-4405-8713-5134a41bad5d'
-  PropagateID: 'cbab45d8-3415-4405-8713-5134a41bad5d'
-  ReservedCode1: '7ec36c76-2753-4f40-bef8-7d5b0954aa31'
-  ReservedCode2: '7ec36c76-2753-4f40-bef8-7d5b0954aa31'
+  ProduceID: 'a2459282-f87e-4076-802f-248627191b6c'
+  PropagateID: 'a2459282-f87e-4076-802f-248627191b6c'
+  ReservedCode1: '00490921-4ddb-4d96-a5ce-1331334afdd7'
+  ReservedCode2: '00490921-4ddb-4d96-a5ce-1331334afdd7'
 ---
 
 # tele-inspect 巡检系统运维
@@ -49,6 +49,87 @@ npm run win:stop      # 停止前端(5000)+后端(8000)，可 -FrontendPort/-Bac
 ### 资源评估（4核8G 云电脑）
 - 运行时：Windows Server 桌面版占 ~2G + 前后端常驻 <1G + Playwright 巡检时临时 0.5G，8G 够用
 - 构建阶段峰值 2-3G：建议在构建机生成 `.next/` + `dist/` 后连同代码拷到服务器，跳过最吃资源的构建步骤
+
+### PostgreSQL 安装（Windows Server 从零部署）
+
+服务器无 PostgreSQL、无 winget/choco/scoop 时，用 EDB 官方 zip 绿色版安装：
+
+```powershell
+# 1. 下载（约 300MB，curl 断点续传比 Invoke-WebRequest 更可靠）
+$dir = ".temp\pg-setup"
+curl.exe -L -C - --retry 3 --retry-delay 5 -o "$dir\pg.zip" `
+  "https://get.enterprisedb.com/postgresql/postgresql-16.9-1-windows-x64-binaries.zip"
+
+# 2. 解压——必须用 tar，不能用 Expand-Archive（后者对大 zip 易超时且可能不完整）
+tar -xf "$dir\pg.zip" -C $dir
+# 验证完整性：share\postgres.bki 必须存在，否则 initdb 会报错
+Test-Path "$dir\pgsql\share\postgres.bki"
+
+# 3. 安装到正式目录（⚠️ 不能用 C:\Program Files\，权限不足 initdb 会失败）
+Copy-Item -Path "$dir\pgsql" -Destination "C:\PostgreSQL\16" -Recurse -Force
+# ⚠️ Copy-Item 可能不完整，务必验证 share\postgres.bki 存在
+
+# 4. 初始化数据目录
+& "C:\PostgreSQL\16\bin\initdb.exe" -D "C:\PostgreSQL\16\data" -U postgres -E UTF8 --locale=C -A trust
+
+# 5. 注册 Windows 服务（⚠️ 不能带 -U postgres，那是 Windows 账户名不是 PG 用户名，会报错 1057）
+& "C:\PostgreSQL\16\bin\pg_ctl.exe" register -N "PostgreSQL16" -D "C:\PostgreSQL\16\data"
+Set-Service -Name "PostgreSQL16" -StartupType Automatic
+Start-Service -Name "PostgreSQL16"
+
+# 6. 建库 + 导入建表脚本
+& "C:\PostgreSQL\16\bin\psql.exe" -U postgres -h 127.0.0.1 -p 5432 -c "CREATE DATABASE inspection_db;"
+& "C:\PostgreSQL\16\bin\psql.exe" -U postgres -h 127.0.0.1 -p 5432 -d inspection_db -f init.sql
+```
+
+**已知坑：**
+- `C:\Program Files\` 下 initdb 报 `Permission denied`，必须用无空格路径如 `C:\PostgreSQL\16`
+- `pg_ctl register -U postgres` 的 `-U` 指的是 Windows 服务运行账户，不是 PostgreSQL 超级用户；系统无 `postgres` Windows 账户时报错 1057，去掉 `-U` 默认用 LocalSystem 即可
+- `Expand-Archive` 解压 300MB zip 易超时且可能不完整（缺 share 目录），改用 `tar -xf` 更快更可靠
+- `Invoke-WebRequest` 下载大文件易超时，改用 `curl.exe -C -` 断点续传
+- trust 认证（`-A trust`）无需密码，后端 `POSTGRES_PASSWORD` 留空即可
+
+### 代码更新与重建（git pull 后）
+
+项目代码可能以非 git 方式拷贝到服务器，需先关联远程再拉取：
+
+```powershell
+# 关联远程仓库（本地非 git 仓库时）
+git init
+git remote add origin git@github.com:Flokken/tele-inspect.git
+git fetch origin
+git checkout -b main --track origin/main -f
+# -f 强制覆盖工作区文件，.gitignore 已排除 node_modules/.next/dist/venv/.temp 等运行文件
+
+# 技能仓库同理
+cd C:\Users\Administrator\.config\TeleAgent\skills\tele-inspect-ops
+git init && git remote add origin git@github.com:Flokken/tele-inspect-ops-skill.git
+git fetch origin && git checkout -b main --track origin/main -f
+```
+
+拉取后重建前端（⚠️ git pull 会覆盖 package.json，之前手动装的依赖会丢失）：
+```powershell
+pnpm install                    # 重新安装依赖
+npx next build                  # 构建
+npx tsup src/server.ts --format cjs --platform node --target node20 --outDir dist --no-splitting --no-minify
+```
+
+**⚠️ 代码更新后必须检查数据库表结构同步**（详见已知坑第 10 条）。
+
+### Windows Server 进程管理
+
+停止前后端服务时，**不要用 `taskkill /F /IM node.exe`** 杀所有 node 进程——TeleAgent 自身也运行 node 进程（Session 0 = Services），全杀会导致系统卡顿、PowerShell 命令超时数分钟。
+
+正确做法：只杀 Console 会话（Session 1）中占用 5000/8000 端口的进程：
+```powershell
+# 用 tasklist 查 PID 和 Session
+tasklist /FI "IMAGENAME eq node.exe" /FO CSV /NH
+# 只杀 Console session 的进程，保留 Services session 的 TeleAgent 进程
+$consoleNodes = @(7928, 1640, 160)  # 替换为实际 Console session PID
+foreach ($procId in $consoleNodes) { Stop-Process -Id $procId -Force -ErrorAction SilentlyContinue }
+```
+
+如果 PowerShell 已经卡住（命令持续超时），等待 30-60 秒后通常会恢复，用 `echo "test"` 测试响应。
 
 ## 巡检核心逻辑（backend/inspector.py）
 
@@ -117,6 +198,9 @@ npm run win:stop      # 停止前端(5000)+后端(8000)，可 -FrontendPort/-Bac
 7. **点击后导航异常处理**：点击 div 按钮触发跳转时 evaluate 会抛 "Execution context was destroyed"，不应判为"验证失败"而应视为"有响应"。用 `clicked` 标志区分点击前后异常：点击后的 evaluate 异常 = 响应成功（页面正在导航），点击前的异常 = 定位/滚动失败。
 8. **Tab 切换检测需含 class 变化**：Tab 点击不改变页面内容长度（body.innerText.length 不变），但 active class 会变（如 `am-tabs-default-bar-tab-active`）。点击响应验证必须增加 class 状态对比，否则 Tab 切换被误判为"无响应"。
 9. **内容异常弹窗可能在 iframe 内渲染**：电信商城 PC 转 H5 模式（`#/pc2h5`）将商品页放在 iframe 内，弹窗在 iframe DOM 中。规则8检测必须遍历 `page.frames` 逐帧执行检测脚本，只检测主页面会漏判。弹窗 class 可能是组件库 hash 类名（如 `cardModal_card_modal_content__xxx`），选择器需用子串匹配而非精确类名。
+10. **代码更新后数据库表结构未同步导致巡检结果不入库**：git pull 拉取新代码后，`insert_result` 可能引用了数据库表里尚不存在的新列（如 `content_error`），导致每次插入都报 `column "xxx" does not exist`。而 `inspect_task` 接口的 except 块只 print 日志不返回错误给前端，前端显示"巡检完成"但实际未入库。**修复要点**：(a) 代码更新后立即对比 `init.sql` 与实际表结构，用 `ALTER TABLE ... ADD COLUMN IF NOT EXISTS` 补齐缺失列；(b) `insert_result` 的 except 块必须返回 `success=False` 及错误信息给前端，不能静默吞掉异常；(c) 超时结果 dict 必须包含 `http_status: 0` 等所有 insert_result 需要的字段，否则 KeyError 也会被静默吞掉。
+11. **废弃 mysql-client.ts 导致 TypeScript 编译失败**：`src/storage/database/mysql-client.ts` 是遗留文件（项目已改用 PostgreSQL），但 `next build` 的 TypeScript 检查会扫描所有 src 下文件。git pull 覆盖 package.json 后 mysql2 依赖丢失，导致编译报 `Cannot find module 'mysql2/promise'`。**修复方式**：确认该文件无任何引用后（grep `mysql-client|mysql2` 在 src 下无匹配），清空文件内容为 `export {};` 注释说明已废弃，不要安装 mysql2 依赖。
+12. **page_title 超长导致 PostgreSQL 拒绝插入**：部分页面 title 可能超过 VARCHAR(256) 限制，`insert_result` 会报 `value too long for type character varying`。修复：inspector.py 中获取 page title 后截断到 256 字符：`result.page_title = title[:256] if title else None`。
 
 ## IM 群机器人 webhook（向量微服务）
 
@@ -187,6 +271,10 @@ psql -U postgres -d inspection_db -c "
 
 - `button_status` / `entry_response` / `jump_status` / `link_status` / `content_error`：-1=N/A, 0=异常, 1=正常
 - `overall_result`：0=异常, 1=正常
+
+### 前端"巡检总数"统计说明
+
+前端结果页（`src/app/results/page.tsx`）显示的"巡检总数"实际是 `results.length`，即前端 API 路由 `GET /api/results` 返回的数组长度。该路由 SQL 硬编码 `LIMIT 200`，所以即使数据库有超过 200 条巡检结果，前端最多显示 200。这不是真实总数，如需准确统计应改为 `SELECT COUNT(*)` 单独查询。
 
 ## 验证命令
 
