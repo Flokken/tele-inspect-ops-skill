@@ -7,10 +7,10 @@ AIGC:
   ContentProducer: '001191110102MAD55U9H0F10002'
   ContentPropagator: '001191110102MAD55U9H0F10002'
   Label: '1'
-  ProduceID: 'a2459282-f87e-4076-802f-248627191b6c'
-  PropagateID: 'a2459282-f87e-4076-802f-248627191b6c'
-  ReservedCode1: '00490921-4ddb-4d96-a5ce-1331334afdd7'
-  ReservedCode2: '00490921-4ddb-4d96-a5ce-1331334afdd7'
+  ProduceID: '5bdb812f-fc14-4b3e-9f24-ec2a208a4c8e'
+  PropagateID: '5bdb812f-fc14-4b3e-9f24-ec2a208a4c8e'
+  ReservedCode1: '636dab4f-5e35-462a-b9a3-063fe1cfacb8'
+  ReservedCode2: '636dab4f-5e35-462a-b9a3-063fe1cfacb8'
 ---
 
 # tele-inspect 巡检系统运维
@@ -201,6 +201,8 @@ foreach ($procId in $consoleNodes) { Stop-Process -Id $procId -Force -ErrorActio
 10. **代码更新后数据库表结构未同步导致巡检结果不入库**：git pull 拉取新代码后，`insert_result` 可能引用了数据库表里尚不存在的新列（如 `content_error`），导致每次插入都报 `column "xxx" does not exist`。而 `inspect_task` 接口的 except 块只 print 日志不返回错误给前端，前端显示"巡检完成"但实际未入库。**修复要点**：(a) 代码更新后立即对比 `init.sql` 与实际表结构，用 `ALTER TABLE ... ADD COLUMN IF NOT EXISTS` 补齐缺失列；(b) `insert_result` 的 except 块必须返回 `success=False` 及错误信息给前端，不能静默吞掉异常；(c) 超时结果 dict 必须包含 `http_status: 0` 等所有 insert_result 需要的字段，否则 KeyError 也会被静默吞掉。
 11. **废弃 mysql-client.ts 导致 TypeScript 编译失败**：`src/storage/database/mysql-client.ts` 是遗留文件（项目已改用 PostgreSQL），但 `next build` 的 TypeScript 检查会扫描所有 src 下文件。git pull 覆盖 package.json 后 mysql2 依赖丢失，导致编译报 `Cannot find module 'mysql2/promise'`。**修复方式**：确认该文件无任何引用后（grep `mysql-client|mysql2` 在 src 下无匹配），清空文件内容为 `export {};` 注释说明已废弃，不要安装 mysql2 依赖。
 12. **page_title 超长导致 PostgreSQL 拒绝插入**：部分页面 title 可能超过 VARCHAR(256) 限制，`insert_result` 会报 `value too long for type character varying`。修复：inspector.py 中获取 page title 后截断到 256 字符：`result.page_title = title[:256] if title else None`。
+13. **video.js 等视频播放器错误提示被规则8误判为异常弹窗**：部分商品页（如 FTTR 宣传页）使用 video.js 视频播放器，headless 浏览器无法播放视频时播放器自动弹出 `vjs-error-display vjs-modal-dialog` 错误提示（"此视频暂无法播放，请稍后再试"），class 含 `modal` 且内容含"请稍后再试"被规则8匹配为异常弹窗。人工访问时视频正常播放不会弹此错误，属 headless 环境特有问题。**修复方式**：(a) 规则8弹窗检测排除 video.js 等播放器错误元素（`vjs-error-display`、`vjs-modal-dialog`、`video-js`、`aliplayer`、`dplayer` 等 class）；(b) Chromium 启动参数添加 `--autoplay-policy=no-user-gesture-required` 和 `--use-fake-ui-for-media-stream` 尽量支持视频播放。
+14. **PC 转 H5 路径被电信安全防护系统拦截（巡检盲区）**：`/page/newmall/index.html#/pc2h5?...` 路径会被电信安全防护系统拦截（405 Method Not Allowed 安全拦截页），页面整体白色无商品内容。但拦截页有文字内容（非空白，规则1不触发）、无弹窗（规则8不触发）、HTTP 200，现有 8 项规则均无法识别，属巡检盲区。而 `/scloud/account/orz/newmallgoods?...` 直连 H5 路径不受拦截、正常打开。**排查要点**：用户报告"页面空白"但巡检报正常时，检查任务 URL 路径是否为 `#/pc2h5` 格式，建议统一使用 `/scloud/account/orz/newmallgoods` 直连路径。
 
 ## IM 群机器人 webhook（向量微服务）
 
@@ -210,6 +212,16 @@ foreach ($procId in $consoleNodes) { Stop-Process -Id $procId -Force -ErrorActio
 - div 模拟按钮与入口检测方案（识别策略、点击验证、Vue SPA 坑）见 references/div-button-entry-detection.md
 
 ## 任务管理与巡检触发
+
+### 电信商城 URL 渠道参数（fromid）
+
+电信商城商品页（`zxkf.cq.189.cn`）的 URL 必须带 `fromid` 渠道参数才能正常访问，缺失时页面弹出"无渠道码！无法打开页面"异常弹窗（规则8 可检出）。
+
+- `fromid=201`：标准/默认销售渠道，约 90% 任务使用
+- 其他值（`389`、`20131351101`、`40602105011` 等）：特定活动或推广入口渠道
+- 具体渠道名称映射属业务编码，需咨询商城/渠道侧业务人员
+
+**排查要点**：用户手动复制链接测试报"无渠道码"异常但任务巡检正常时，检查用户链接是否缺少 `fromid` 参数。任务配置的 URL 应始终带正确的 `fromid`。
 
 ### 创建任务（前端 API，非后端）
 
@@ -274,7 +286,7 @@ psql -U postgres -d inspection_db -c "
 
 ### 前端"巡检总数"统计说明
 
-前端结果页（`src/app/results/page.tsx`）显示的"巡检总数"实际是 `results.length`，即前端 API 路由 `GET /api/results` 返回的数组长度。该路由 SQL 硬编码 `LIMIT 200`，所以即使数据库有超过 200 条巡检结果，前端最多显示 200。这不是真实总数，如需准确统计应改为 `SELECT COUNT(*)` 单独查询。
+前端结果页（`src/app/results/page.tsx`）显示的"巡检总数"等统计数字。**原版代码**中该值为 `results.length`，即前端 API 路由 `GET /api/results` 返回的数组长度，而该路由 SQL 硬编码 `LIMIT 200`，导致即使数据库有超过 200 条巡检结果，前端最多显示 200。**已修复**：results API 新增 `SELECT COUNT(*) FILTER(WHERE ...)` 全量统计查询（total/normal/abnormal），与列表分页查询分离；前端统计卡片改用 API 返回的 `stats` 字段。同时修复了 export API 的 `LIMIT 1000` 和 tasks API 的 `LIMIT 100`。
 
 ## 验证命令
 
